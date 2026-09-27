@@ -79,6 +79,14 @@ public final class CfnRollback {
     public static final String DASHBOARD_UPDATE_SNAPSHOT_ATTR = "__FlociDashboardUpdateSnapshot";
 
     /**
+     * Holds the name, description and endpoint configuration a REST API had before an in-place
+     * update patched them, and whether the update also re-applied an OpenAPI document, so a failed
+     * stack update can put them back. Written by {@code ApiGatewayRestApiCfnProvisioner} before its
+     * update call and spent by its {@code rollbackUpdate}.
+     */
+    public static final String REST_API_UPDATE_SNAPSHOT_ATTR = "__FlociRestApiUpdateSnapshot";
+
+    /**
      * Holds the complete prior metric filter, identity, name mode and per-address mutation outcomes
      * and ownership states.
      * Written before either an in-place put or a delete-then-create replacement; retained across
