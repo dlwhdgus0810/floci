@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayService;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.Authorizer;
@@ -13,12 +14,15 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
 
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * CloudFormation provisioning for the REST API Gateway core types. RestApi, Resource, Method,
@@ -31,12 +35,16 @@ import java.util.Set;
 @ApplicationScoped
 public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
 
+    private static final Logger LOG = Logger.getLogger(ApiGatewayRestApiCfnProvisioner.class);
+
     private static final String REST_API = "AWS::ApiGateway::RestApi";
     private static final String RESOURCE = "AWS::ApiGateway::Resource";
     private static final String METHOD = "AWS::ApiGateway::Method";
     private static final String DEPLOYMENT = "AWS::ApiGateway::Deployment";
     private static final String STAGE = "AWS::ApiGateway::Stage";
     private static final String AUTHORIZER = "AWS::ApiGateway::Authorizer";
+    /** The API a Resource was created on: its id is unique only within that API. */
+    private static final String REST_API_ID_ATTR = "__FlociRestApiId";
 
     private final ApiGatewayService apiGatewayService;
     private final S3Service s3Service;
@@ -69,16 +77,46 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
     }
 
     @Override
+    public void delete(StackResource resource, String region) {
+        if (RESOURCE.equals(resource.getResourceType())) {
+            deleteResource(region, resource.getAttributes().get(REST_API_ID_ATTR), resource.getPhysicalId());
+            return;
+        }
+        delete(resource.getResourceType(), resource.getPhysicalId(), region);
+    }
+
+    @Override
     public void delete(String resourceType, String physicalId, String region) {
-        // Only the RestApi has a backing delete; deleting it cascades to its resources, methods,
-        // deployments, stages and authorizers, so the child types own no separate delete, the same
-        // as the legacy switch (their delete fell through to a no-op).
+        // A Resource or Method can sit on an API outside the stack, where no RestApi delete
+        // cascades to it, so each removes its own entity. Deployment, Stage and Authorizer have
+        // no delete of their own yet.
         if (REST_API.equals(resourceType)) {
             // Tolerate an API already removed out of band so DeleteStack does not fail on it;
             // deleteRestApi resolves the id first and raises NotFoundException when it is gone.
             CfnDeletes.safeDelete("REST API", physicalId,
                     () -> apiGatewayService.deleteRestApi(region, physicalId), "NotFoundException");
+        } else if (METHOD.equals(resourceType)) {
+            deleteMethod(region, physicalId);
         }
+    }
+
+    private void deleteResource(String region, String apiId, String resourceId) {
+        CfnDeletes.safeDelete("API resource", resourceId,
+                () -> apiGatewayService.deleteResource(region, apiId, resourceId), "NotFoundException");
+    }
+
+    /**
+     * Deletes a method by its physical id, {@code <RestApiId>-<ResourceId>-<HttpMethod>}. Split from
+     * the right: a custom API id can contain a hyphen, a resource id or HTTP method cannot.
+     */
+    private void deleteMethod(String region, String physicalId) {
+        int methodStart = physicalId.lastIndexOf('-');
+        int resourceStart = physicalId.lastIndexOf('-', methodStart - 1);
+        String apiId = physicalId.substring(0, resourceStart);
+        String resourceId = physicalId.substring(resourceStart + 1, methodStart);
+        String httpMethod = physicalId.substring(methodStart + 1);
+        CfnDeletes.safeDelete("API method", physicalId,
+                () -> apiGatewayService.deleteMethod(region, apiId, resourceId, httpMethod), "NotFoundException");
     }
 
     private void provisionRestApi(StackResource r, JsonNode props, ProvisionContext ctx) {
@@ -134,16 +172,44 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void provisionResource(StackResource r, JsonNode props, ProvisionContext ctx) {
+        String region = ctx.region();
         String apiId = ctx.resolveOptional(props, "RestApiId");
         String parentId = ctx.resolveOptional(props, "ParentId");
         String pathPart = ctx.resolveOptional(props, "PathPart");
 
-        Map<String, Object> req = new HashMap<>();
-        req.put("pathPart", pathPart);
-
-        ApiGatewayResource res = apiGatewayService.createResource(ctx.region(), apiId, parentId, req);
+        // RestApiId, ParentId and PathPart are all createOnly, so an update that keeps them keeps
+        // the resource. Creating it again collides with itself under the same parent.
+        ApiGatewayResource res = ctx.isUpdate()
+                ? findPrior("API resource", ctx.priorPhysicalId(),
+                        () -> apiGatewayService.getResource(region, apiId, ctx.priorPhysicalId()))
+                : null;
+        if (res == null || !Objects.equals(res.getParentId(), parentId)
+                || !Objects.equals(res.getPathPart(), pathPart)) {
+            Map<String, Object> req = new HashMap<>();
+            req.put("pathPart", pathPart);
+            res = apiGatewayService.createResource(region, apiId, parentId, req);
+        }
         r.setPhysicalId(res.getId());
         r.getAttributes().put("ResourceId", res.getId());
+        // A replaced resource goes once its replacement exists, taking its methods with it. It is
+        // on the API recorded for it, which differs from the template's when RestApiId changed.
+        if (ctx.isUpdate() && !res.getId().equals(ctx.priorPhysicalId())) {
+            deleteResource(region, r.getAttributes().getOrDefault(REST_API_ID_ATTR, apiId), ctx.priorPhysicalId());
+        }
+        r.getAttributes().put(REST_API_ID_ATTR, apiId);
+    }
+
+    /** What {@code lookup} finds, or null when the entity from the previous provision is gone. */
+    private static <T> T findPrior(String description, String id, Supplier<T> lookup) {
+        try {
+            return lookup.get();
+        } catch (AwsException e) {
+            if (!"NotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            LOG.debugv("{0} {1} from the previous provision is gone, creating a new one", description, id);
+            return null;
+        }
     }
 
     private void provisionAuthorizer(StackResource r, JsonNode props, ProvisionContext ctx) {
@@ -225,6 +291,13 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
                             statusCode, responseReq);
                 }
             }
+        }
+
+        // RestApiId, ResourceId and HttpMethod are createOnly, so a different one is a new method
+        // and the one it replaced is removed. putMethod upper-cases the method, which makes a
+        // change of case alone the same method.
+        if (ctx.isUpdate() && !ctx.priorPhysicalId().equalsIgnoreCase(r.getPhysicalId())) {
+            deleteMethod(region, ctx.priorPhysicalId());
         }
     }
 

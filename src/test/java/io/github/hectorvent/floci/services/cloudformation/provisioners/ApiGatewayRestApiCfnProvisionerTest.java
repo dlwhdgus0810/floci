@@ -33,7 +33,8 @@ import static org.mockito.Mockito.when;
 
 /**
  * The REST API Gateway core types in isolation: the physical id and the exact Fn::GetAtt keys each
- * publishes, the inline-stage shortcut on a Deployment, and that only the RestApi deletes.
+ * publishes, the inline-stage shortcut on a Deployment, what an update keeps or replaces, and what
+ * each type deletes.
  */
 class ApiGatewayRestApiCfnProvisionerTest {
 
@@ -78,6 +79,50 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
+    void resourceUpdateKeepsAnUnchangedResource() throws Exception {
+        when(api.getResource("us-east-1", "api-1", "res-1")).thenReturn(apiResource("res-1", "root-1", "orders"));
+
+        StackResource r = resource("AWS::ApiGateway::Resource", "Res");
+        provisioner.provision(r, props("""
+                {"RestApiId": "api-1", "ParentId": "root-1", "PathPart": "orders"}
+                """), ctx("res-1"));
+
+        assertEquals("res-1", r.getPhysicalId());
+        assertEquals("res-1", r.getAttributes().get("ResourceId"));
+        verify(api, never()).createResource(anyString(), anyString(), anyString(), anyMap());
+        verify(api, never()).deleteResource(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void resourceUpdateReplacesTheResourceForANewPathPart() throws Exception {
+        when(api.getResource("us-east-1", "api-1", "res-1")).thenReturn(apiResource("res-1", "root-1", "orders"));
+        when(api.createResource(eq("us-east-1"), eq("api-1"), eq("root-1"), anyMap()))
+                .thenReturn(apiResource("res-2", "root-1", "items"));
+
+        StackResource r = resource("AWS::ApiGateway::Resource", "Res");
+        provisioner.provision(r, props("""
+                {"RestApiId": "api-1", "ParentId": "root-1", "PathPart": "items"}
+                """), ctx("res-1"));
+
+        assertEquals("res-2", r.getPhysicalId());
+        verify(api).deleteResource("us-east-1", "api-1", "res-1");
+    }
+
+    @Test
+    void resourceDeleteRemovesItFromTheApiItWasCreatedOn() throws Exception {
+        when(api.createResource(eq("us-east-1"), eq("api-1"), eq("root-1"), anyMap()))
+                .thenReturn(apiResource("res-1", "root-1", "orders"));
+        StackResource r = resource("AWS::ApiGateway::Resource", "Res");
+        provisioner.provision(r, props("""
+                {"RestApiId": "api-1", "ParentId": "root-1", "PathPart": "orders"}
+                """), ctx());
+
+        provisioner.delete(r, "us-east-1");
+
+        verify(api).deleteResource("us-east-1", "api-1", "res-1");
+    }
+
+    @Test
     void authorizerPublishesAuthorizerId() throws Exception {
         Authorizer authorizer = new Authorizer();
         authorizer.setId("auth-1");
@@ -103,6 +148,28 @@ class ApiGatewayRestApiCfnProvisionerTest {
         assertEquals("api-1-res-1-GET", r.getPhysicalId());
         verify(api).putMethod(eq("us-east-1"), eq("api-1"), eq("res-1"), eq("GET"), anyMap());
         verify(api).putIntegration(eq("us-east-1"), eq("api-1"), eq("res-1"), eq("GET"), anyMap());
+    }
+
+    @Test
+    void methodUpdateRemovesTheMethodItReplaced() throws Exception {
+        StackResource r = resource("AWS::ApiGateway::Method", "Get");
+        provisioner.provision(r, props("""
+                {"RestApiId": "a1b2c3", "ResourceId": "d4e5f6", "HttpMethod": "POST"}
+                """), ctx("a1b2c3-d4e5f6-GET"));
+
+        assertEquals("a1b2c3-d4e5f6-POST", r.getPhysicalId());
+        verify(api).deleteMethod("us-east-1", "a1b2c3", "d4e5f6", "GET");
+    }
+
+    @Test
+    void methodUpdateOfTheSameMethodDeletesNothing() throws Exception {
+        StackResource r = resource("AWS::ApiGateway::Method", "Get");
+        provisioner.provision(r, props("""
+                {"RestApiId": "a1b2c3", "ResourceId": "d4e5f6", "HttpMethod": "GET"}
+                """), ctx("a1b2c3-d4e5f6-get"));
+
+        verify(api).putMethod(eq("us-east-1"), eq("a1b2c3"), eq("d4e5f6"), eq("GET"), anyMap());
+        verify(api, never()).deleteMethod(anyString(), anyString(), anyString(), anyString());
     }
 
     @Test
@@ -160,12 +227,18 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
-    void deleteRemovesOnlyTheRestApi() {
+    void deleteRemovesTheRestApi() {
         provisioner.delete("AWS::ApiGateway::RestApi", "api-1", "us-east-1");
         verify(api).deleteRestApi("us-east-1", "api-1");
+    }
 
-        provisioner.delete("AWS::ApiGateway::Method", "api-1-res-1-GET", "us-east-1");
-        verify(api, never()).deleteRestApi("us-east-1", "api-1-res-1-GET");
+    @Test
+    void deleteRemovesAMethodFromItsResource() {
+        // A custom API id can contain hyphens; a resource id and an HTTP method cannot.
+        provisioner.delete("AWS::ApiGateway::Method", "my-api-d4e5f6-GET", "us-east-1");
+
+        verify(api).deleteMethod("us-east-1", "my-api", "d4e5f6", "GET");
+        verify(api, never()).deleteRestApi(anyString(), anyString());
     }
 
     @Test
@@ -186,13 +259,25 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     private ProvisionContext ctx() {
+        return ctx(null);
+    }
+
+    private ProvisionContext ctx(String priorPhysicalId) {
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
         when(engine.resolve(any())).thenAnswer(inv -> {
             JsonNode node = inv.getArgument(0);
             return node == null ? null : node.asText();
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
-        return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
+        return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", priorPhysicalId);
+    }
+
+    private static ApiGatewayResource apiResource(String id, String parentId, String pathPart) {
+        ApiGatewayResource resource = new ApiGatewayResource();
+        resource.setId(id);
+        resource.setParentId(parentId);
+        resource.setPathPart(pathPart);
+        return resource;
     }
 
     private JsonNode props(String json) throws Exception {
