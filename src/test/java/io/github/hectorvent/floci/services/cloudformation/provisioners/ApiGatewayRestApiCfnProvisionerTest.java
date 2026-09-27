@@ -122,6 +122,33 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
+    void rollbackOfAKeptResourceHasNothingToUndo() throws Exception {
+        when(api.getResource("us-east-1", "api-1", "res-1")).thenReturn(apiResource("res-1", "root-1", "orders"));
+        StackResource r = resource("AWS::ApiGateway::Resource", "Res");
+        provisioner.provision(r, props("""
+                {"RestApiId": "api-1", "ParentId": "root-1", "PathPart": "orders"}
+                """), ctx("res-1"));
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals("res-1", r.getPhysicalId());
+        verify(api, never()).createResource(anyString(), anyString(), anyString(), anyMap());
+        verify(api, never()).deleteResource(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void rollbackOfAKeptMethodIsNotImplemented() throws Exception {
+        StackResource r = resource("AWS::ApiGateway::Method", "Get");
+        provisioner.provision(r, props("""
+                {"RestApiId": "a1b2c3", "ResourceId": "d4e5f6", "HttpMethod": "GET"}
+                """), ctx("a1b2c3-d4e5f6-GET"));
+
+        // putMethod rewrote the method in place, and nothing kept what it was before.
+        assertFalse(provisioner.rollbackUpdate(r));
+        verify(api, never()).deleteMethod(anyString(), anyString(), anyString(), anyString());
+    }
+
+    @Test
     void resourceReplacementKeepsTheDisplacedResourceUnderRetain() throws Exception {
         StackResource r = replacedResource();
         r.setUpdateReplacePolicy("Retain");

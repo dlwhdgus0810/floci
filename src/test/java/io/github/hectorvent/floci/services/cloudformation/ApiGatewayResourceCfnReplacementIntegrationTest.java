@@ -16,7 +16,8 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 /**
  * A new PathPart replaces an AWS::ApiGateway::Resource on an API outside the stack. The displaced
  * resource is deleted in the cleanup after the update commits, kept under UpdateReplacePolicy:
- * Retain, and still there when a later resource fails the update and it rolls back.
+ * Retain, and still there when a later resource fails the update and it rolls back. A resource the
+ * update kept has nothing to roll back.
  */
 @QuarkusTest
 class ApiGatewayResourceCfnReplacementIntegrationTest {
@@ -83,6 +84,25 @@ class ApiGatewayResourceCfnReplacementIntegrationTest {
 
             deleteStack(stack);
             assertPaths(api[0], "/");
+        } finally {
+            deleteStack(stack);
+            deleteApi(api[0]);
+        }
+    }
+
+    @Test
+    void keptResourceHasNothingToRollBack() {
+        String stack = "apigw-cfn-resource-kept-rollback-it";
+        String[] api = createApi("cfn-resource-kept-rollback");
+        try {
+            stackAction(stack, "CreateStack", TEMPLATE.formatted(api[0], api[1], "infrastructures", "Delete", ""));
+            String kept = resourceIdOnceStatusIs(stack, "CREATE_COMPLETE");
+
+            stackAction(stack, "UpdateStack", TEMPLATE.formatted(api[0], api[1], "infrastructures", "Delete",
+                    FAILING_RESOURCE.formatted(api[0])));
+            assertEquals(kept, resourceIdOnceStatusIs(stack, "UPDATE_ROLLBACK_COMPLETE"));
+
+            assertPaths(api[0], "/", "/infrastructures");
         } finally {
             deleteStack(stack);
             deleteApi(api[0]);

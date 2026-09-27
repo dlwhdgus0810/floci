@@ -174,11 +174,17 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         ReplacementCleanup.clear(resource);
     }
 
-    /** Puts a replaced Resource or Method back when a later resource fails the update. */
+    /**
+     * Puts a replaced Resource or Method back when a later resource fails the update. Without a
+     * replacement, a Resource update changed nothing, since all its properties are createOnly, so
+     * there is nothing to undo. A Method the update kept was written in place, with no snapshot to
+     * put back.
+     */
     @Override
     public boolean rollbackUpdate(StackResource resource) {
         return ReplacementCleanup.rollback(resource,
-                (type, physicalId, region) -> deleteEntity(resource, physicalId, region));
+                (type, physicalId, region) -> deleteEntity(resource, physicalId, region))
+                || RESOURCE.equals(resource.getResourceType());
     }
 
     /** A resource of a REST API, or with an HTTP method, one of that resource's methods. */
