@@ -32,6 +32,9 @@ class ApiGatewayResourceCfnUpdateIntegrationTest {
                 "RootGet": {"Type":"AWS::ApiGateway::Method", "Properties":{
                   "RestApiId":"%1$s", "ResourceId":"%2$s",
                   "HttpMethod":"GET", "AuthorizationType":"NONE", "Integration":{"Type":"MOCK"}}},
+                "RootCustom": {"Type":"AWS::ApiGateway::Method", "Properties":{
+                  "RestApiId":"%1$s", "ResourceId":"%2$s",
+                  "HttpMethod":"X-CUSTOM", "AuthorizationType":"NONE", "Integration":{"Type":"MOCK"}}},
                 "Deployment%3$s": {"Type":"AWS::ApiGateway::Deployment", "DependsOn":["Opt","RootGet"],
                   "Properties":{"RestApiId":"%1$s", "StageName":"local"}}
               },
@@ -64,6 +67,9 @@ class ApiGatewayResourceCfnUpdateIntegrationTest {
             given().when().get("/restapis/" + apiId + "/resources").then().statusCode(200)
                     .body("item.path", contains("/"));
             given().when().get("/restapis/" + apiId + "/resources/" + rootId + "/methods/GET")
+                    .then().statusCode(404);
+            // A hyphen in the method makes its physical id ambiguous; the recorded location is not.
+            given().when().get("/restapis/" + apiId + "/resources/" + rootId + "/methods/X-CUSTOM")
                     .then().statusCode(404);
 
             stackAction("CreateStack", TEMPLATE.formatted(apiId, rootId, "2"));

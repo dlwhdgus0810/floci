@@ -1,7 +1,10 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayService;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
@@ -43,8 +46,14 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
     private static final String DEPLOYMENT = "AWS::ApiGateway::Deployment";
     private static final String STAGE = "AWS::ApiGateway::Stage";
     private static final String AUTHORIZER = "AWS::ApiGateway::Authorizer";
-    /** The API a Resource was created on: its id is unique only within that API. */
-    private static final String REST_API_ID_ATTR = "__FlociRestApiId";
+    /**
+     * Where the entities a Resource or Method stack resource has named live, keyed by physical id:
+     * the API of a Resource, and the API, resource and HTTP method of a Method. The physical id
+     * cannot say it: a resource id does not name its API, and a method id joins parts that can
+     * themselves contain the joining hyphen. The entry of a replaced entity stays, so the cleanup
+     * after the update commits, or a rollback, deletes the right one.
+     */
+    private static final String LOCATIONS_ATTR = "__FlociApiGatewayLocations";
 
     private final ApiGatewayService apiGatewayService;
     private final S3Service s3Service;
@@ -76,47 +85,139 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
+    /**
+     * A Resource or Method can sit on an API outside the stack, where no RestApi delete cascades to
+     * it, so each removes its own entity, found through the location recorded for it. Deployment,
+     * Stage and Authorizer have no delete of their own yet.
+     */
     @Override
     public void delete(StackResource resource, String region) {
-        if (RESOURCE.equals(resource.getResourceType())) {
-            deleteResource(region, resource.getAttributes().get(REST_API_ID_ATTR), resource.getPhysicalId());
-            return;
-        }
-        delete(resource.getResourceType(), resource.getPhysicalId(), region);
+        deleteEntity(resource, resource.getPhysicalId(), region);
     }
 
     @Override
     public void delete(String resourceType, String physicalId, String region) {
-        // A Resource or Method can sit on an API outside the stack, where no RestApi delete
-        // cascades to it, so each removes its own entity. Deployment, Stage and Authorizer have
-        // no delete of their own yet.
         if (REST_API.equals(resourceType)) {
             // Tolerate an API already removed out of band so DeleteStack does not fail on it;
             // deleteRestApi resolves the id first and raises NotFoundException when it is gone.
             CfnDeletes.safeDelete("REST API", physicalId,
                     () -> apiGatewayService.deleteRestApi(region, physicalId), "NotFoundException");
         } else if (METHOD.equals(resourceType)) {
-            deleteMethod(region, physicalId);
+            Location location = parseMethodId(physicalId);
+            if (location != null) {
+                deleteLocation(physicalId, location, region);
+            }
         }
     }
 
-    private void deleteResource(String region, String apiId, String resourceId) {
-        CfnDeletes.safeDelete("API resource", resourceId,
-                () -> apiGatewayService.deleteResource(region, apiId, resourceId), "NotFoundException");
+    /**
+     * Deletes the entity {@code physicalId} names, at the location recorded for it on
+     * {@code resource}. A resource provisioned before locations were recorded has only its id to go
+     * by, which names a method but not the API of a resource.
+     */
+    private void deleteEntity(StackResource resource, String physicalId, String region) {
+        Location location = locations(resource).get(physicalId);
+        if (location == null) {
+            delete(resource.getResourceType(), physicalId, region);
+            return;
+        }
+        deleteLocation(physicalId, location, region);
+    }
+
+    private void deleteLocation(String physicalId, Location location, String region) {
+        if (location.httpMethod() == null) {
+            CfnDeletes.safeDelete("API resource", physicalId, () -> apiGatewayService.deleteResource(
+                    region, location.restApiId(), location.resourceId()), "NotFoundException");
+        } else {
+            CfnDeletes.safeDelete("API method", physicalId, () -> apiGatewayService.deleteMethod(
+                    region, location.restApiId(), location.resourceId(), location.httpMethod()), "NotFoundException");
+        }
     }
 
     /**
-     * Deletes a method by its physical id, {@code <RestApiId>-<ResourceId>-<HttpMethod>}. Split from
-     * the right: a custom API id can contain a hyphen, a resource id or HTTP method cannot.
+     * The location in a method's physical id, {@code <RestApiId>-<ResourceId>-<HttpMethod>}, for a
+     * method provisioned before locations were recorded. Split from the right, which is right unless
+     * the HTTP method has a hyphen: a custom API id can contain one, a resource id cannot.
      */
-    private void deleteMethod(String region, String physicalId) {
-        int methodStart = physicalId.lastIndexOf('-');
-        int resourceStart = physicalId.lastIndexOf('-', methodStart - 1);
-        String apiId = physicalId.substring(0, resourceStart);
-        String resourceId = physicalId.substring(resourceStart + 1, methodStart);
-        String httpMethod = physicalId.substring(methodStart + 1);
-        CfnDeletes.safeDelete("API method", physicalId,
-                () -> apiGatewayService.deleteMethod(region, apiId, resourceId, httpMethod), "NotFoundException");
+    private static Location parseMethodId(String physicalId) {
+        int methodStart = physicalId == null ? -1 : physicalId.lastIndexOf('-');
+        int resourceStart = methodStart > 0 ? physicalId.lastIndexOf('-', methodStart - 1) : -1;
+        if (resourceStart <= 0) {
+            return null;
+        }
+        return new Location(physicalId.substring(0, resourceStart),
+                physicalId.substring(resourceStart + 1, methodStart), physicalId.substring(methodStart + 1));
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
+    }
+
+    /**
+     * Deletes the Resource or Method a replacement displaced, once the stack update has committed.
+     * {@link ReplacementCleanup} keeps it under {@code UpdateReplacePolicy: Retain}.
+     */
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        return ReplacementCleanup.complete(resource,
+                (type, physicalId, region) -> deleteEntity(resource, physicalId, region));
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        ReplacementCleanup.clear(resource);
+    }
+
+    /** Puts a replaced Resource or Method back when a later resource fails the update. */
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        return ReplacementCleanup.rollback(resource,
+                (type, physicalId, region) -> deleteEntity(resource, physicalId, region));
+    }
+
+    /** A resource of a REST API, or with an HTTP method, one of that resource's methods. */
+    private record Location(String restApiId, String resourceId, String httpMethod) {
+    }
+
+    private Map<String, Location> locations(StackResource r) {
+        Map<String, Location> locations = new HashMap<>();
+        String recorded = r.getAttributes().get(LOCATIONS_ATTR);
+        if (recorded == null) {
+            return locations;
+        }
+        try {
+            objectMapper.readTree(recorded).fields().forEachRemaining(entry -> locations.put(entry.getKey(),
+                    new Location(entry.getValue().path(0).asText(), entry.getValue().path(1).asText(),
+                            entry.getValue().path(2).asText(null))));
+        } catch (JsonProcessingException e) {
+            LOG.warnv("Unreadable API Gateway locations on {0}, ignoring them: {1}", r.getLogicalId(), e.getMessage());
+        }
+        return locations;
+    }
+
+    /**
+     * Records where the entity {@code r} now names lives, keeping the entry of the one this update
+     * replaced until the next provision.
+     */
+    private void recordLocation(StackResource r, ProvisionContext ctx, Location location) {
+        ObjectNode recorded = objectMapper.createObjectNode();
+        Location prior = ctx.isUpdate() ? locations(r).get(ctx.priorPhysicalId()) : null;
+        if (prior != null && !ctx.priorPhysicalId().equals(r.getPhysicalId())) {
+            recorded.set(ctx.priorPhysicalId(), locationNode(prior));
+        }
+        recorded.set(r.getPhysicalId(), locationNode(location));
+        r.getAttributes().put(LOCATIONS_ATTR, recorded.toString());
+    }
+
+    private ArrayNode locationNode(Location location) {
+        ArrayNode node = objectMapper.createArrayNode().add(location.restApiId()).add(location.resourceId());
+        return location.httpMethod() == null ? node : node.add(location.httpMethod());
     }
 
     private void provisionRestApi(StackResource r, JsonNode props, ProvisionContext ctx) {
@@ -172,6 +273,7 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void provisionResource(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> attributesBefore = new HashMap<>(r.getAttributes());
         String region = ctx.region();
         String apiId = ctx.resolveOptional(props, "RestApiId");
         String parentId = ctx.resolveOptional(props, "ParentId");
@@ -191,12 +293,9 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         }
         r.setPhysicalId(res.getId());
         r.getAttributes().put("ResourceId", res.getId());
-        // A replaced resource goes once its replacement exists, taking its methods with it. It is
-        // on the API recorded for it, which differs from the template's when RestApiId changed.
-        if (ctx.isUpdate() && !res.getId().equals(ctx.priorPhysicalId())) {
-            deleteResource(region, r.getAttributes().getOrDefault(REST_API_ID_ATTR, apiId), ctx.priorPhysicalId());
-        }
-        r.getAttributes().put(REST_API_ID_ATTR, apiId);
+        recordLocation(r, ctx, new Location(apiId, res.getId(), null));
+        // A replaced resource is deleted, with its methods, once the stack update commits.
+        ReplacementCleanup.record(r, ctx, attributesBefore);
     }
 
     /** What {@code lookup} finds, or null when the entity from the previous provision is gone. */
@@ -229,6 +328,7 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void provisionMethod(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> attributesBefore = new HashMap<>(r.getAttributes());
         String region = ctx.region();
         CloudFormationTemplateEngine engine = ctx.engine();
         String apiId = ctx.resolveOptional(props, "RestApiId");
@@ -244,7 +344,11 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         req.put("apiKeyRequired", Boolean.parseBoolean(ctx.resolveOrDefault(props, "ApiKeyRequired", "false")));
 
         apiGatewayService.putMethod(region, apiId, resourceId, httpMethod, req);
-        r.setPhysicalId(apiId + "-" + resourceId + "-" + httpMethod);
+        // putMethod upper-cases the method, so a change of case alone names the same method. The
+        // prior id stays, or the cleanup would delete the method as the one this update replaced.
+        String physicalId = apiId + "-" + resourceId + "-" + httpMethod;
+        r.setPhysicalId(ctx.isUpdate() && ctx.priorPhysicalId().equalsIgnoreCase(physicalId)
+                ? ctx.priorPhysicalId() : physicalId);
 
         if (props != null && props.has("MethodResponses")) {
             JsonNode responses = engine.resolveNode(props.get("MethodResponses"));
@@ -293,12 +397,10 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
             }
         }
 
-        // RestApiId, ResourceId and HttpMethod are createOnly, so a different one is a new method
-        // and the one it replaced is removed. putMethod upper-cases the method, which makes a
-        // change of case alone the same method.
-        if (ctx.isUpdate() && !ctx.priorPhysicalId().equalsIgnoreCase(r.getPhysicalId())) {
-            deleteMethod(region, ctx.priorPhysicalId());
-        }
+        // RestApiId, ResourceId and HttpMethod are createOnly, so a different one is a new method,
+        // and the one it replaced is deleted once the stack update commits.
+        recordLocation(r, ctx, new Location(apiId, resourceId, httpMethod));
+        ReplacementCleanup.record(r, ctx, attributesBefore);
     }
 
     private Map<String, String> resolveStringMap(JsonNode props, String name,

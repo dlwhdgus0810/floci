@@ -20,7 +20,9 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -94,18 +96,39 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
-    void resourceUpdateReplacesTheResourceForANewPathPart() throws Exception {
-        when(api.getResource("us-east-1", "api-1", "res-1")).thenReturn(apiResource("res-1", "root-1", "orders"));
-        when(api.createResource(eq("us-east-1"), eq("api-1"), eq("root-1"), anyMap()))
-                .thenReturn(apiResource("res-2", "root-1", "items"));
-
-        StackResource r = resource("AWS::ApiGateway::Resource", "Res");
-        provisioner.provision(r, props("""
-                {"RestApiId": "api-1", "ParentId": "root-1", "PathPart": "items"}
-                """), ctx("res-1"));
+    void resourceReplacementDeletesTheDisplacedResourceOnlyOnceTheUpdateCommits() throws Exception {
+        StackResource r = replacedResource();
 
         assertEquals("res-2", r.getPhysicalId());
+        verify(api, never()).deleteResource(anyString(), anyString(), anyString());
+        assertTrue(provisioner.hasReplacementUpdate(r));
+        assertEquals("res-1", provisioner.updateCleanupPhysicalId(r));
+
+        assertTrue(provisioner.completeUpdate(r).complete());
         verify(api).deleteResource("us-east-1", "api-1", "res-1");
+    }
+
+    @Test
+    void resourceReplacementRollsBackToTheDisplacedResource() throws Exception {
+        StackResource r = replacedResource();
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals("res-1", r.getPhysicalId());
+        assertEquals("res-1", r.getAttributes().get("ResourceId"));
+        verify(api).deleteResource("us-east-1", "api-1", "res-2");
+        verify(api, never()).deleteResource("us-east-1", "api-1", "res-1");
+        assertFalse(provisioner.hasReplacementUpdate(r));
+    }
+
+    @Test
+    void resourceReplacementKeepsTheDisplacedResourceUnderRetain() throws Exception {
+        StackResource r = replacedResource();
+        r.setUpdateReplacePolicy("Retain");
+
+        provisioner.completeUpdate(r);
+
+        verify(api, never()).deleteResource(anyString(), anyString(), anyString());
     }
 
     @Test
@@ -151,14 +174,22 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
-    void methodUpdateRemovesTheMethodItReplaced() throws Exception {
-        StackResource r = resource("AWS::ApiGateway::Method", "Get");
+    void methodReplacementDeletesTheDisplacedMethodAtItsRecordedLocation() throws Exception {
+        // Neither the API id nor the HTTP method can be told apart from the joining hyphens of
+        // "my-api-d4e5f6-X-OLD", so only the recorded location names the method to delete.
+        StackResource r = resource("AWS::ApiGateway::Method", "Custom");
         provisioner.provision(r, props("""
-                {"RestApiId": "a1b2c3", "ResourceId": "d4e5f6", "HttpMethod": "POST"}
-                """), ctx("a1b2c3-d4e5f6-GET"));
+                {"RestApiId": "my-api", "ResourceId": "d4e5f6", "HttpMethod": "X-OLD"}
+                """), ctx());
+        provisioner.provision(r, props("""
+                {"RestApiId": "my-api", "ResourceId": "d4e5f6", "HttpMethod": "POST"}
+                """), ctx("my-api-d4e5f6-X-OLD"));
 
-        assertEquals("a1b2c3-d4e5f6-POST", r.getPhysicalId());
-        verify(api).deleteMethod("us-east-1", "a1b2c3", "d4e5f6", "GET");
+        assertEquals("my-api-d4e5f6-POST", r.getPhysicalId());
+        verify(api, never()).deleteMethod(anyString(), anyString(), anyString(), anyString());
+
+        provisioner.completeUpdate(r);
+        verify(api).deleteMethod("us-east-1", "my-api", "d4e5f6", "X-OLD");
     }
 
     @Test
@@ -168,8 +199,21 @@ class ApiGatewayRestApiCfnProvisionerTest {
                 {"RestApiId": "a1b2c3", "ResourceId": "d4e5f6", "HttpMethod": "GET"}
                 """), ctx("a1b2c3-d4e5f6-get"));
 
+        assertEquals("a1b2c3-d4e5f6-get", r.getPhysicalId());
         verify(api).putMethod(eq("us-east-1"), eq("a1b2c3"), eq("d4e5f6"), eq("GET"), anyMap());
-        verify(api, never()).deleteMethod(anyString(), anyString(), anyString(), anyString());
+        assertFalse(provisioner.hasReplacementUpdate(r));
+    }
+
+    @Test
+    void methodDeleteUsesTheRecordedLocationOfAHyphenatedMethod() throws Exception {
+        StackResource r = resource("AWS::ApiGateway::Method", "Custom");
+        provisioner.provision(r, props("""
+                {"RestApiId": "my-api", "ResourceId": "d4e5f6", "HttpMethod": "X-CUSTOM"}
+                """), ctx());
+
+        provisioner.delete(r, "us-east-1");
+
+        verify(api).deleteMethod("us-east-1", "my-api", "d4e5f6", "X-CUSTOM");
     }
 
     @Test
@@ -233,9 +277,13 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
-    void deleteRemovesAMethodFromItsResource() {
-        // A custom API id can contain hyphens; a resource id and an HTTP method cannot.
-        provisioner.delete("AWS::ApiGateway::Method", "my-api-d4e5f6-GET", "us-east-1");
+    void deleteOfAMethodWithNoRecordedLocationSplitsItsId() {
+        // A method provisioned before locations were recorded has only its id. A custom API id can
+        // contain hyphens, a resource id cannot.
+        StackResource r = resource("AWS::ApiGateway::Method", "Get");
+        r.setPhysicalId("my-api-d4e5f6-GET");
+
+        provisioner.delete(r, "us-east-1");
 
         verify(api).deleteMethod("us-east-1", "my-api", "d4e5f6", "GET");
         verify(api, never()).deleteRestApi(anyString(), anyString());
@@ -270,6 +318,21 @@ class ApiGatewayRestApiCfnProvisionerTest {
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", priorPhysicalId);
+    }
+
+    /** A Resource created as res-1 at /orders, then replaced by res-2 at /items. */
+    private StackResource replacedResource() throws Exception {
+        when(api.createResource(eq("us-east-1"), eq("api-1"), eq("root-1"), anyMap()))
+                .thenReturn(apiResource("res-1", "root-1", "orders"), apiResource("res-2", "root-1", "items"));
+        when(api.getResource("us-east-1", "api-1", "res-1")).thenReturn(apiResource("res-1", "root-1", "orders"));
+        StackResource r = resource("AWS::ApiGateway::Resource", "Res");
+        provisioner.provision(r, props("""
+                {"RestApiId": "api-1", "ParentId": "root-1", "PathPart": "orders"}
+                """), ctx());
+        provisioner.provision(r, props("""
+                {"RestApiId": "api-1", "ParentId": "root-1", "PathPart": "items"}
+                """), ctx("res-1"));
+        return r;
     }
 
     private static ApiGatewayResource apiResource(String id, String parentId, String pathPart) {
