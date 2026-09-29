@@ -2371,9 +2371,10 @@ public class ApiGatewayService {
 
     /**
      * The endpoint configuration {@code patchOperations} leave {@code api} with, or null when none of
-     * them touches it. {@code replace /endpointConfiguration/types/<type>} changes the type, and as
-     * for a domain name the path names the type the API has now. {@code add} and {@code remove
-     * /endpointConfiguration/vpcEndpointIds} associate and disassociate a VPC endpoint.
+     * them touches it. {@code replace /endpointConfiguration/types/<type>} changes the type: the path
+     * names the type the API has now, as for a domain name, or its index, {@code 0}, which is what
+     * Terraform sends. {@code add} and {@code remove /endpointConfiguration/vpcEndpointIds} associate
+     * and disassociate a VPC endpoint.
      */
     private static EndpointConfiguration patchEndpointConfiguration(RestApi api,
                                                                     List<Map<String, String>> patchOperations) {
@@ -2388,9 +2389,12 @@ public class ApiGatewayService {
             String path = op.getOrDefault("path", "");
             String value = op.get("value");
             if ("replace".equals(operation) && path.startsWith(EPC_TYPES_PATH)) {
-                if (!path.equals(EPC_TYPES_PATH + type)) {
+                // An API has exactly one type, so its index is always 0.
+                String typeRef = path.substring(EPC_TYPES_PATH.length());
+                if (!typeRef.equals(type.name()) && !typeRef.equals("0")) {
                     throw new AwsException("BadRequestException", "Invalid patch path " + path
-                            + ": the path must name the API's current endpoint type, " + type, 400);
+                            + ": the path must name the API's current endpoint type, " + type
+                            + ", or its index, 0", 400);
                 }
                 type = endpointType(Objects.toString(value, ""));
                 patched = true;

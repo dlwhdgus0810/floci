@@ -56,6 +56,15 @@ public class ApiGatewayUpdateRestApiIntegrationTest {
                 .statusCode(400);
         given().get("/restapis/" + id).then().statusCode(200)
                 .body("endpointConfiguration.types", contains("EDGE"));
+
+        // Terraform names the type by its index instead; an API has only the one at 0.
+        patch(id, """
+                [{"op":"replace","path":"/endpointConfiguration/types/0","value":"REGIONAL"}]""")
+                .statusCode(200)
+                .body("endpointConfiguration.types", contains("REGIONAL"));
+        patch(id, """
+                [{"op":"replace","path":"/endpointConfiguration/types/1","value":"EDGE"}]""")
+                .statusCode(400);
     }
 
     @Test
