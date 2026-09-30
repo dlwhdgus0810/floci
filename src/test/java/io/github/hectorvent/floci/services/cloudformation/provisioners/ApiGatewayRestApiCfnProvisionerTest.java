@@ -182,6 +182,24 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
+    void restApiUpdateDeletesTheRecreatedApiWhenItsBodyIsRejected() throws Exception {
+        when(api.getRestApi("us-east-1", "api-1"))
+                .thenThrow(new AwsException("NotFoundException", "Invalid API id specified", 404));
+        when(api.createRestApi(eq("us-east-1"), anyMap())).thenReturn(restApi("api-2", "shop", null, "REGIONAL"));
+        when(api.findRootResourceId("us-east-1", "api-2")).thenReturn(Optional.of("root-2"));
+        when(api.putRestApi(eq("us-east-1"), eq("api-2"), eq("overwrite"), anyString()))
+                .thenThrow(new AwsException("BadRequestException", "Invalid OpenAPI input", 400));
+        StackResource r = resource("AWS::ApiGateway::RestApi", "Api");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"Name": "shop", "Body": {"openapi": "3.0.1", "paths": {}}}
+                """), ctx("api-1")));
+
+        // The failed update leaves the stack with its previous resource, so nothing else would delete it.
+        verify(api).deleteRestApi("us-east-1", "api-2");
+    }
+
+    @Test
     void resourcePublishesResourceId() throws Exception {
         ApiGatewayResource res = new ApiGatewayResource();
         res.setId("res-1");

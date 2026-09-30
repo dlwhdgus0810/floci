@@ -324,6 +324,8 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
             } catch (RuntimeException failure) {
                 if (existing != null) {
                     unwind(r, failure);
+                } else if (ctx.isUpdate()) {
+                    discard(api.getId(), region, failure);
                 }
                 throw failure;
             }
@@ -425,6 +427,20 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
                     "Could not roll back the update of REST API " + r.getPhysicalId() + ": "
                             + unwindFailure.getMessage());
             failure.addSuppressed(unwindFailure);
+        }
+    }
+
+    /**
+     * Deletes the API an update created in place of one removed out of band, when putRestApi
+     * rejected its OpenAPI document. CloudFormationService restores the resource the stack held
+     * before the attempt, so nothing else tracks the new API. A delete that fails is attached to
+     * {@code failure}, which stays the reported error.
+     */
+    private void discard(String apiId, String region, RuntimeException failure) {
+        try {
+            delete(REST_API, apiId, region);
+        } catch (RuntimeException deleteFailure) {
+            failure.addSuppressed(deleteFailure);
         }
     }
 
