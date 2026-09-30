@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iam;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -261,36 +262,12 @@ public class AssumeRolePolicyEvaluator {
         if (!values.isTextual()) {
             return false;
         }
-        if ("StringEquals".equals(operator)) {
-            return values.asText().equals(actual);
-        }
-        return globMatchesCaseSensitive(values.asText(), actual);
-    }
-
-    private boolean globMatchesCaseSensitive(String pattern, String value) {
-        int patternIndex = 0;
-        int valueIndex = 0;
-        int starIndex = -1;
-        int starValueIndex = -1;
-        while (valueIndex < value.length()) {
-            if (patternIndex < pattern.length()
-                    && (pattern.charAt(patternIndex) == '?' || pattern.charAt(patternIndex) == value.charAt(valueIndex))) {
-                patternIndex++;
-                valueIndex++;
-            } else if (patternIndex < pattern.length() && pattern.charAt(patternIndex) == '*') {
-                starIndex = patternIndex++;
-                starValueIndex = valueIndex;
-            } else if (starIndex >= 0) {
-                patternIndex = starIndex + 1;
-                valueIndex = ++starValueIndex;
-            } else {
-                return false;
-            }
-        }
-        while (patternIndex < pattern.length() && pattern.charAt(patternIndex) == '*') {
-            patternIndex++;
-        }
-        return patternIndex == pattern.length();
+        return switch (operator) {
+            case "StringEquals" -> values.asText().equals(actual);
+            case "StringLike" -> IamPolicyEvaluator.caseSensitiveGlobMatches(values.asText(), actual);
+            case "ArnEquals", "ArnLike" -> IamPolicyEvaluator.matchesArnCondition(values.asText(), actual);
+            default -> false;
+        };
     }
 
     private boolean matchesServicePrincipal(JsonNode principalNode, String servicePrincipal) {
@@ -301,12 +278,16 @@ public class AssumeRolePolicyEvaluator {
         if (service == null) {
             return false;
         }
+        // A policy may name the service in the universal form or the partition form AWS accepted
+        // before it (elasticmapreduce.amazonaws.com.cn); both sides are folded to the universal
+        // one so either matches, still exactly and case-sensitively.
+        String wanted = ServicePrincipals.canonical(servicePrincipal);
         if (service.isTextual()) {
-            return service.asText().equals(servicePrincipal);
+            return ServicePrincipals.canonical(service.asText()).equals(wanted);
         }
         if (service.isArray()) {
             for (JsonNode entry : service) {
-                if (entry.isTextual() && entry.asText().equals(servicePrincipal)) {
+                if (entry.isTextual() && ServicePrincipals.canonical(entry.asText()).equals(wanted)) {
                     return true;
                 }
             }

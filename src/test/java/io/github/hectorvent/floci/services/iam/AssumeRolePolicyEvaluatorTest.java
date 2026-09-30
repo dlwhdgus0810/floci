@@ -21,6 +21,38 @@ class AssumeRolePolicyEvaluatorTest {
     }
 
     @Test
+    void allowsAServicePrincipalInTheUniversalForm() {
+        assertTrue(evaluator.allowsService(
+                trust("{\"Service\":\"redshift.amazonaws.com\"}"), "redshift.amazonaws.com"));
+        assertFalse(evaluator.allowsService(
+                trust("{\"Service\":\"lambda.amazonaws.com\"}"), "redshift.amazonaws.com"));
+    }
+
+    @Test
+    void allowsAServicePrincipalWrittenInTheLegacyPartitionForm() {
+        // AWS still honours the per-partition forms it used before the universal rule, so a
+        // trust policy written in China or ISO spelling matches the universal principal.
+        assertTrue(evaluator.allowsService(
+                trust("{\"Service\":\"elasticmapreduce.amazonaws.com.cn\"}"), "elasticmapreduce.amazonaws.com"));
+        assertTrue(evaluator.allowsService(
+                trust("{\"Service\":[\"logs.cn-north-1.amazonaws.com.cn\",\"lambda.amazonaws.com\"]}"),
+                "logs.amazonaws.com"));
+        assertTrue(evaluator.allowsService(trust("{\"Service\":\"config.c2s.ic.gov\"}"), "config.amazonaws.com"));
+        // And the other way round: the check itself may arrive in a legacy spelling.
+        assertTrue(evaluator.allowsService(
+                trust("{\"Service\":\"redshift.amazonaws.com\"}"), "redshift.amazonaws.com.cn"));
+    }
+
+    @Test
+    void aServicePrincipalMatchesExactlyAndCaseSensitivelyInEitherForm() {
+        assertFalse(evaluator.allowsService(trust("{\"Service\":\"*.amazonaws.com\"}"), "redshift.amazonaws.com"));
+        assertFalse(evaluator.allowsService(
+                trust("{\"Service\":\"Redshift.amazonaws.com\"}"), "redshift.amazonaws.com"));
+        assertFalse(evaluator.allowsService(
+                trust("{\"Service\":\"redshift.AMAZONAWS.COM.CN\"}"), "redshift.amazonaws.com"));
+    }
+
+    @Test
     void allowsAccountRootPrincipal() {
         assertTrue(evaluator.allows(
                 trust("{\"AWS\":\"arn:aws:iam::111111111111:root\"}"), CALLER_ARN, CALLER_ACCOUNT));
@@ -241,6 +273,17 @@ class AssumeRolePolicyEvaluatorTest {
                 "arn:aws:appsync:us-east-1:000000000000:apis/Example", "000000000000"));
         assertFalse(evaluator.allowsService(doc, "appsync.amazonaws.com",
                 "arn:aws:appsync:us-east-1:000000000000:apis/example", "000000000000"));
+    }
+
+    @Test
+    void serviceSourceArnWildcardCannotCrossArnComponents() {
+        String doc = """
+            {"Statement":{"Effect":"Allow","Principal":{"Service":"appsync.amazonaws.com"},
+              "Action":"sts:AssumeRole",
+              "Condition":{"ArnLike":{"aws:SourceArn":"arn:aws:lambda:us-east-1:*:worker"}}}}
+            """;
+        assertFalse(evaluator.allowsService(doc, "appsync.amazonaws.com",
+                "arn:aws:lambda:us-east-1:111122223333:function:worker", "111122223333"));
     }
 
     @Test

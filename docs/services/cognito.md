@@ -5,6 +5,10 @@
 
 Floci serves pool-specific discovery and JWKS endpoints, plus a relaxed OAuth token endpoint, so local clients can mint and validate Cognito-like access tokens against RS256 signing keys.
 
+When configured, `PostAuthentication` and `PreTokenGeneration` Lambda triggers must succeed
+before authentication or token issuance completes. Function errors and malformed responses
+return Cognito Lambda errors instead of issuing tokens without the trigger's claims.
+
 `CreateUserPool` supports overriding several values using user-pool tags **only** at creation time:
 * `floci:override-id`, to pin the resulting `UserPool.Id`. Because a pinned id is caller-chosen it can be reused, which AWS never does. `DeleteUserPool` therefore deletes everything the pool owns (users, groups, app clients, resource servers, revoked token records and outstanding verification codes) so a pool recreated on the same id starts empty rather than inheriting the deleted pool's password hashes and client secrets.
 * `floci:override-cognito-client-id`
@@ -199,7 +203,21 @@ further divergences, both deliberate:
 |--------|-------------|
 | InitiateAuth | Authenticates app-client users through supported user-password and SRP-style flows. |
 | AdminInitiateAuth | Starts an admin authentication flow for a user pool user. |
-| RespondToAuthChallenge | Responds to supported Cognito auth challenges. |
+| RespondToAuthChallenge | Responds to supported Cognito auth challenges, including TOTP setup and software-token MFA. |
+| AssociateSoftwareToken | Creates a TOTP secret for a user identified by an MFA setup session or access token. |
+| VerifySoftwareToken | Verifies the TOTP code and enables the user's software token. |
+
+With `MfaConfiguration=ON` and software-token MFA enabled, a successful password or SRP
+first factor returns `MFA_SETUP` instead of tokens for a user without a verified token.
+Call `AssociateSoftwareToken` with that session, then `VerifySoftwareToken` with the
+returned session and a six-digit TOTP code. Finish with `RespondToAuthChallenge`
+(`MFA_SETUP`) to receive tokens. Later sign-ins return `SOFTWARE_TOKEN_MFA`, which
+requires a fresh code in `SOFTWARE_TOKEN_MFA_CODE`. Both token-management actions
+also accept an access token for an already authenticated user. Sessions expire with
+the app client's `AuthSessionValidity` and cannot be replayed after completion.
+
+This flow currently covers software-token MFA required by a pool. Optional MFA
+preferences, SMS/email MFA challenges, and managed-login MFA are not emulated.
 
 ### User Listing
 

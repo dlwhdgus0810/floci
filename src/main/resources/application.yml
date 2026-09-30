@@ -100,6 +100,7 @@ quarkus:
       - --initialize-at-run-time=io.github.hectorvent.floci.services.acm.CertificateGenerator
       - --initialize-at-run-time=io.github.hectorvent.floci.config.TlsConfigSource
       - --initialize-at-run-time=io.github.hectorvent.floci.services.cognito.CognitoSrpHelper
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.cognito.CognitoTotp
       - --initialize-at-run-time=io.github.hectorvent.floci.services.route53.Route53Service
       - --initialize-at-run-time=io.github.hectorvent.floci.services.kms.KmsService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.bedrockagentcore.BedrockAgentCoreEventService
@@ -163,8 +164,8 @@ floci:
       # mount-user:           # run mounting containers as "uid[:gid]" (access point PosixUser)
       # mount-group-add:      # supplementary gid added to mounting containers
     wal:
-      # Also the cadence at which journaled stores under persistent mode (CloudWatch Logs events)
-      # fold their .wal file into the store's JSON file.
+      # Also the cadence at which journaled stores under persistent mode (CloudWatch Logs events,
+      # the S3 object index) fold their .wal file into the store's JSON file.
       compaction-interval-ms: 30000
     services:
       ssm:
@@ -250,6 +251,18 @@ floci:
     container-fallback-servers:                   # FLOCI_DNS_CONTAINER_FALLBACK_SERVERS=1.1.1.1,1.0.0.1
       - 8.8.8.8
       - 8.8.4.4
+
+    # Transparent endpoint injection: answer A queries for every AWS partition's DNS and
+    # dual-stack suffix (and every subdomain) with Floci's container IP inside spawned
+    # containers, so SDK clients constructed with explicit real-AWS endpoints, which override
+    # AWS_ENDPOINT_URL, land on the emulator. Suffixes: amazonaws.com, api.aws,
+    # amazonaws.com.cn, api.amazonwebservices.com.cn, amazonaws.eu, api.amazonwebservices.eu,
+    # c2s.ic.gov, api.aws.ic.gov, sc2s.sgov.gov, api.aws.scloud, cloud.adc-e.uk,
+    # api.cloud-aws.adc-e.uk, csp.hci.ic.gov, api.aws.hci.ic.gov. Live suffixes like api.aws and
+    # amazonaws.eu resolve to Floci while this is on.
+    # Combine with tls.enabled so clients that hardcode https:// are served on port 443
+    # with a certificate covering those suffixes and their regional wildcards.
+    spoof-aws-endpoints: false                    # FLOCI_DNS_SPOOF_AWS_ENDPOINTS
 
   auth:
     validate-signatures: false

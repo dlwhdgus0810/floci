@@ -1,12 +1,23 @@
 package io.github.hectorvent.floci.services.ssm;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2ImageCatalog;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
+import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
 import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import io.github.hectorvent.floci.services.ssm.model.ParameterHistory;
 import io.github.hectorvent.floci.services.ssm.model.ParameterStringFilter;
@@ -14,19 +25,17 @@ import io.github.hectorvent.floci.services.ssm.model.PatchBaselineIdentity;
 import io.github.hectorvent.floci.services.ssm.model.ServiceSetting;
 import io.github.hectorvent.floci.services.ssm.model.SsmAssociation;
 import io.github.hectorvent.floci.services.ssm.model.SsmDocument;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
-import io.github.hectorvent.floci.core.resource.ResourceProvider;
-import io.github.hectorvent.floci.core.resource.SupportedResourceType;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import java.util.ArrayList;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class SsmService implements ResourceProvider {
@@ -34,10 +43,16 @@ public class SsmService implements ResourceProvider {
     private static final Logger LOG = Logger.getLogger(SsmService.class);
 
     private static final String PUBLIC_PARAMETER_PREFIX = "/aws/service/";
+    private static final DateTimeFormatter SOURCE_RESULT_DATE =
+            DateTimeFormatter.ofPattern("MMM d, yyyy, h:mm:ss a", Locale.US).withZone(ZoneOffset.UTC);
+    static final String SECRET_REFERENCE_PREFIX = "/aws/reference/secretsmanager/";
     // Label is a ParameterStringFilter key too, but only GetParametersByPath accepts it.
     private static final Set<String> DESCRIBE_PARAMETERS_FILTER_KEYS =
             Set.of("Name", "Type", "KeyId", "Path", "Tier", "DataType");
     private static final String DEFAULT_SSM_KEY_ID = "alias/aws/ssm";
+    private static final String TAG_KEY_REGEX = "^([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)$";
+    private static final Pattern TAG_KEY_PATTERN = Pattern.compile(TAG_KEY_REGEX);
+    private static final int MAX_TAG_KEY_LENGTH = 128;
 
     /**
      * Account-default values for the service settings floci models. AWS rejects
@@ -59,10 +74,11 @@ public class SsmService implements ResourceProvider {
     private final int maxParameterHistory;
     private final RegionResolver regionResolver;
     private final Ec2ImageCatalog imageCatalog;
+    private final SecretsManagerService secretsManager;
 
     @Inject
     public SsmService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
-                      Ec2ImageCatalog imageCatalog) {
+                      Ec2ImageCatalog imageCatalog, SecretsManagerService secretsManager) {
         this(
                 storageFactory.create("ssm", "ssm-parameters.json",
                         new TypeReference<>() {
@@ -84,7 +100,8 @@ public class SsmService implements ResourceProvider {
                         }),
                 config.services().ssm().maxParameterHistory(),
                 regionResolver,
-                imageCatalog
+                imageCatalog,
+                secretsManager
         );
     }
 
@@ -129,7 +146,7 @@ public class SsmService implements ResourceProvider {
                StorageBackend<String, SsmAssociation> associationStore,
                int maxParameterHistory, RegionResolver regionResolver) {
         this(parameterStore, historyStore, documentPermissionStore, documentStore,
-                serviceSettingStore, associationStore, maxParameterHistory, regionResolver, null);
+                serviceSettingStore, associationStore, maxParameterHistory, regionResolver, null, null);
     }
 
     /**
@@ -143,7 +160,7 @@ public class SsmService implements ResourceProvider {
                StorageBackend<String, ServiceSetting> serviceSettingStore,
                StorageBackend<String, SsmAssociation> associationStore,
                int maxParameterHistory, RegionResolver regionResolver,
-               Ec2ImageCatalog imageCatalog) {
+               Ec2ImageCatalog imageCatalog, SecretsManagerService secretsManager) {
         this.parameterStore = parameterStore;
         this.historyStore = historyStore;
         this.documentPermissionStore = documentPermissionStore;
@@ -153,6 +170,7 @@ public class SsmService implements ResourceProvider {
         this.maxParameterHistory = maxParameterHistory;
         this.regionResolver = regionResolver;
         this.imageCatalog = imageCatalog;
+        this.secretsManager = secretsManager;
     }
 
     /**
@@ -165,6 +183,7 @@ public class SsmService implements ResourceProvider {
 
     public long putParameter(String name, String value, String type, String description, boolean overwrite,
                              Map<String, String> tags, String region) {
+        validateTagKeys(tags);
         rejectReservedName(name);
         String storageKey = regionKey(region, name);
         Parameter existing = parameterStore.get(storageKey).orElse(null);
@@ -204,7 +223,15 @@ public class SsmService implements ResourceProvider {
         return version;
     }
 
+    /** Reads on behalf of ECS task secrets, CodeBuild and CloudFormation ssm-secure, which decrypt. */
     public Parameter getParameter(String name, String region) {
+        return getParameter(name, true, region);
+    }
+
+    public Parameter getParameter(String name, boolean withDecryption, String region) {
+        if (name != null && name.startsWith(SECRET_REFERENCE_PREFIX)) {
+            return secretReference(name, withDecryption, region);
+        }
         return findParameter(name, region).orElseThrow(() -> {
             int separator = name == null ? -1 : name.lastIndexOf(':');
             if (separator > 0 && separator < name.length() - 1
@@ -217,12 +244,116 @@ public class SsmService implements ResourceProvider {
         });
     }
 
-    public List<Parameter> getParameters(List<String> names, String region) {
+    /** A name AWS cannot answer, whatever the reason, is left out rather than failing the call. */
+    public List<Parameter> getParameters(List<String> names, boolean withDecryption, String region) {
         List<Parameter> result = new ArrayList<>();
         for (String name : names) {
-            findParameter(name, region).ifPresent(result::add);
+            try {
+                result.add(getParameter(name, withDecryption, region));
+            } catch (AwsException e) {
+                LOG.debugv("GetParameters lists {0} as invalid: {1}", name, e.getMessage());
+            }
         }
         return result;
+    }
+
+    /**
+     * The resource IAM checks a reference read on: the secret's ARN, or for a secret that does not
+     * exist, the ARN a GetSecretValue by that name is checked on, so a missing secret is refused too.
+     * Null for a malformed name, which AWS rejects before it calls Secrets Manager.
+     */
+    String secretReferenceArn(String name, String region) {
+        SecretReferenceName reference = SecretReferenceName.of(name);
+        if (reference.malformed()) {
+            return null;
+        }
+        String secretId = reference.secretId();
+        try {
+            return secretsManager.describeSecret(secretId, region).getArn();
+        } catch (AwsException expected) {
+            // No such secret: check the name instead, so the caller is refused either way.
+            return regionResolver.buildArn("secretsmanager", region, "secret:" + secretId);
+        }
+    }
+
+    /**
+     * AWS answers {@code /aws/reference/secretsmanager/<secret-id>[:<version-id-or-label>]} with the
+     * secret's value. The order of the checks and the error texts are what AWS sends, including the
+     * missing slash and the "null" it prints for a name without a selector.
+     */
+    private Parameter secretReference(String name, boolean withDecryption, String region) {
+        SecretReferenceName reference = SecretReferenceName.of(name);
+        String secretId = reference.secretId();
+        String selector = reference.selector();
+        if (reference.malformed()) {
+            throw new AwsException("ValidationException", "Invalid parameter name. Please use correct syntax "
+                    + "for referencing a version/label  <name>:<version/label>", 400);
+        }
+        if (!withDecryption) {
+            throw new AwsException("ValidationException",
+                    "WithDecryption flag must be True for retrieving a Secret Manager secret.", 400);
+        }
+        Secret secret;
+        SecretVersion version;
+        try {
+            secret = secretsManager.describeSecret(secretId, region);
+            boolean byId = selector != null && secret.getVersions().containsKey(selector);
+            // By the ARN just described, so a secret replaced in between is not found rather than read.
+            // A miss still falls back to a secret named like the ARN's last part ("app-AbCdEf"), a
+            // name AWS warns against, so that fallback is deliberately not guarded here.
+            version = secretsManager.getSecretValue(secret.getArn(), byId ? selector : null,
+                    byId ? null : selector, region);
+        } catch (AwsException e) {
+            if ("ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw new AwsException("ParameterNotFound", "An error occurred (ParameterNotFound) when referencing "
+                        + "Secrets Manager: Secret " + name.substring(1) + (selector == null ? "null" : "")
+                        + " not found.", 400);
+            }
+            throw new AwsException("ValidationException", "Invalid Request to Secrets Manager", 400);
+        }
+        Parameter parameter = new Parameter(SECRET_REFERENCE_PREFIX + secretId, version.getSecretString(), "SecureString");
+        parameter.setVersion(0);
+        parameter.setArn(secret.getArn());
+        parameter.setLastModifiedDate(version.getCreatedDate());
+        parameter.setDataType(null);
+        parameter.setSelector(selector == null ? null : ":" + selector);
+        parameter.setSourceResult(sourceResult(secret, version));
+        return parameter;
+    }
+
+    /** The secret id and the version id or staging label after the first colon, if any. */
+    private record SecretReferenceName(String secretId, String selector) {
+        static SecretReferenceName of(String name) {
+            String reference = name.substring(SECRET_REFERENCE_PREFIX.length());
+            int colon = reference.indexOf(':');
+            return colon < 0 ? new SecretReferenceName(reference, null)
+                    : new SecretReferenceName(reference.substring(0, colon), reference.substring(colon + 1));
+        }
+
+        /** A trailing colon or a second one, which AWS rejects before anything else. */
+        boolean malformed() {
+            return selector != null && (selector.isEmpty() || selector.contains(":"));
+        }
+    }
+
+    /**
+     * AWS's GetSecretValue result the way SSM serializes it: Gson's field names, order and default
+     * US date format in UTC, with null fields left out.
+     */
+    private static String sourceResult(Secret secret, SecretVersion version) {
+        ObjectNode result = JsonNodeFactory.instance.objectNode()
+                .put("ARN", secret.getArn())
+                .put("name", secret.getName())
+                .put("versionId", version.getVersionId());
+        if (version.getSecretString() != null) {
+            result.put("secretString", version.getSecretString());
+        }
+        // AWS dumps a binary secret's ByteBuffer internals here; left out until a caller reads them.
+        if (version.getVersionStages() != null) {
+            ArrayNode stages = result.putArray("versionStages");
+            version.getVersionStages().forEach(stages::add);
+        }
+        return result.put("createdDate", SOURCE_RESULT_DATE.format(version.getCreatedDate())).toString();
     }
 
     /**
@@ -587,6 +718,7 @@ public class SsmService implements ResourceProvider {
     }
 
     public void addTagsToResource(String resourceId, Map<String, String> tags, String region) {
+        validateTagKeys(tags);
         String normalizedId = normalizeResourceId(resourceId);
         String storageKey = regionKey(region, normalizedId);
         Parameter param = parameterStore.get(storageKey)
@@ -599,6 +731,32 @@ public class SsmService implements ResourceProvider {
         param.getTags().putAll(tags);
         parameterStore.put(storageKey, param);
         LOG.debugv("Added tags to parameter: {0}", resourceId);
+    }
+
+    /**
+     * The key constraint AWS checks before any lookup, naming the offending key by its 1-based
+     * position in the request's {@code Tags} list.
+     */
+    public static void validateTagKeys(Map<String, String> tags) {
+        if (tags == null) {
+            return;
+        }
+        int position = 0;
+        for (String key : tags.keySet()) {
+            position++;
+            String constraint;
+            if (key.isEmpty()) {
+                constraint = "Member must have length greater than or equal to 1";
+            } else if (key.codePointCount(0, key.length()) > MAX_TAG_KEY_LENGTH) {
+                constraint = "Member must have length less than or equal to " + MAX_TAG_KEY_LENGTH;
+            } else if (!TAG_KEY_PATTERN.matcher(key).matches()) {
+                constraint = "Member must satisfy regular expression pattern: " + TAG_KEY_REGEX;
+            } else {
+                continue;
+            }
+            throw new AwsException("ValidationException", "1 validation error detected: Value at 'tags."
+                    + position + ".member.key' failed to satisfy constraint: " + constraint, 400);
+        }
     }
 
     public Map<String, String> listTagsForResource(String resourceId, String region) {
