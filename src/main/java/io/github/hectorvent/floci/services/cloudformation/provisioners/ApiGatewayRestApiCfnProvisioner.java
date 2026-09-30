@@ -325,7 +325,7 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
                 if (existing != null) {
                     unwind(r, failure);
                 } else if (ctx.isUpdate()) {
-                    discard(api.getId(), region, failure);
+                    discard(r, api.getId(), region, failure);
                 }
                 throw failure;
             }
@@ -433,14 +433,20 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
     /**
      * Deletes the API an update created in place of one removed out of band, when putRestApi
      * rejected its OpenAPI document. CloudFormationService restores the resource the stack held
-     * before the attempt, so nothing else tracks the new API. A delete that fails is attached to
-     * {@code failure}, which stays the reported error.
+     * before the attempt, so nothing else tracks the new API. An API that cannot be deleted is
+     * listed for the next cleanup, which the restored resource inherits, and the update reports a
+     * rollback failure. {@code failure} stays the reported error.
      */
-    private void discard(String apiId, String region, RuntimeException failure) {
+    private void discard(StackResource r, String apiId, String region, RuntimeException failure) {
         try {
             delete(REST_API, apiId, region);
         } catch (RuntimeException deleteFailure) {
             failure.addSuppressed(deleteFailure);
+            String reason = "Could not remove REST API " + apiId + ", created for " + r.getLogicalId()
+                    + " by a failed update: " + deleteFailure.getMessage();
+            LOG.warn(reason);
+            r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, reason);
+            ReplacementCleanup.recordOrphan(r, apiId, REST_API, region);
         }
     }
 

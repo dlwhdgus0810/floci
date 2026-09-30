@@ -200,6 +200,29 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
+    void restApiUpdateListsARecreatedApiItCannotDeleteAndReportsTheRollbackFailure() throws Exception {
+        when(api.getRestApi("us-east-1", "api-1"))
+                .thenThrow(new AwsException("NotFoundException", "Invalid API id specified", 404));
+        when(api.createRestApi(eq("us-east-1"), anyMap())).thenReturn(restApi("api-2", "shop", null, "REGIONAL"));
+        when(api.findRootResourceId("us-east-1", "api-2")).thenReturn(Optional.of("root-2"));
+        when(api.putRestApi(eq("us-east-1"), eq("api-2"), eq("overwrite"), anyString()))
+                .thenThrow(new AwsException("BadRequestException", "Invalid OpenAPI input", 400));
+        doThrow(new AwsException("TooManyRequestsException", "Too Many Requests", 429))
+                .when(api).deleteRestApi("us-east-1", "api-2");
+        StackResource r = resource("AWS::ApiGateway::RestApi", "Api");
+
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"Name": "shop", "Body": {"openapi": "3.0.1", "paths": {}}}
+                """), ctx("api-1")));
+
+        assertEquals("BadRequestException", failure.getErrorCode());
+        assertEquals(1, failure.getSuppressed().length);
+        assertTrue(r.getAttributes().getOrDefault(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, "").contains("api-2"));
+        // Listed for the next cleanup, which the resource the engine restores inherits.
+        assertTrue(r.getAttributes().getOrDefault(CfnRollback.REPLACEMENT_CLEANUP_ATTR, "").contains("\"api-2\""));
+    }
+
+    @Test
     void resourcePublishesResourceId() throws Exception {
         ApiGatewayResource res = new ApiGatewayResource();
         res.setId("res-1");
