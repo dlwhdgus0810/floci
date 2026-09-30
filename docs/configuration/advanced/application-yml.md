@@ -58,8 +58,8 @@ floci:
       # mount-user: "1001:1001"    # PosixUser: run mounting containers as uid[:gid]
       # mount-group-add: 2000      # supplementary gid added to mounting containers
     wal:
-      # Also the cadence at which journaled stores under persistent mode (CloudWatch Logs events)
-      # fold their .wal file into the store's JSON file.
+      # Also the cadence at which journaled stores under persistent mode (CloudWatch Logs events,
+      # the S3 object index) fold their .wal file into the store's JSON file.
       compaction-interval-ms: 30000
     services:
       ssm:
@@ -91,6 +91,16 @@ floci:
     # Via env var (comma-separated): FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud,other.internal
     # extra-suffixes:
     #   - localhost.localstack.cloud
+
+    # Transparent endpoint injection: resolve every AWS partition's DNS and dual-stack
+    # suffix (amazonaws.com, api.aws, amazonaws.eu, amazonaws.com.cn and the rest; see
+    # environment-variables.md for the full list) and every subdomain to Floci's
+    # container IP inside spawned containers, so SDK clients built with explicit
+    # real-AWS endpoints (which override AWS_ENDPOINT_URL) land on the emulator.
+    # Live suffixes like api.aws and amazonaws.eu resolve to Floci while this is on.
+    # Combine with tls.enabled for clients that hardcode https://.
+    # Via env var: FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true
+    spoof-aws-endpoints: false
 
   auth:
     validate-signatures: false               # Set to true to verify S3 presigned URL signatures
