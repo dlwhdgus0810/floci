@@ -100,6 +100,21 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
+    void restApiUpdateRejectsMoreThanOneEndpointTypeBeforeChangingAnything() throws Exception {
+        existingApi(restApi("api-1", "shop", "v1", "REGIONAL"));
+        StackResource r = resource("AWS::ApiGateway::RestApi", "Api");
+
+        // CreateRestApi rejects the same list.
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"Name": "shop", "Description": "v2", "EndpointConfiguration": {"Types": ["REGIONAL", "EDGE"]}}
+                """), ctx("api-1")));
+
+        assertEquals("BadRequestException", e.getErrorCode());
+        verify(api, never()).updateRestApi(anyString(), anyString(), any());
+        assertFalse(r.getAttributes().containsKey(CfnRollback.REST_API_UPDATE_SNAPSHOT_ATTR));
+    }
+
+    @Test
     void restApiRollbackPutsBackWhatTheUpdatePatched() throws Exception {
         existingApi(restApi("api-1", "shop", "v1", "REGIONAL"));
         StackResource r = resource("AWS::ApiGateway::RestApi", "Api");

@@ -275,6 +275,12 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         }
         String description = ctx.resolveOptional(props, "Description");
         JsonNode endpoint = props != null ? props.get("EndpointConfiguration") : null;
+        List<String> endpointTypes = endpoint != null ? ctx.resolveStringList(endpoint, "Types") : List.of();
+        // CreateRestApi rejects more than one type. An update rejects them too, before anything changes.
+        if (endpointTypes.size() > 1) {
+            throw new AwsException("BadRequestException",
+                    "Endpoint configuration types must contain exactly one value.", 400);
+        }
         // A declared Body or BodyS3Location is the whole OpenAPI document. Measured on real AWS
         // it becomes the RestApi's Body with no synthesized Resource or Method, so putRestApi plus
         // applyOpenApiSpec is the only place that turns it into resources and methods. Resolved
@@ -287,9 +293,9 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
             List<Map<String, String>> operations = new ArrayList<>(List.of(
                     replacePatchOp("/name", name), replacePatchOp("/description", description)));
             if (endpoint != null) {
-                List<String> types = ctx.resolveStringList(endpoint, "Types");
                 operations.addAll(endpointPatchOps(existing.getEndpointConfiguration(),
-                        types.isEmpty() ? null : types.getFirst(), ctx.resolveStringList(endpoint, "VpcEndpointIds")));
+                        endpointTypes.isEmpty() ? null : endpointTypes.getFirst(),
+                        ctx.resolveStringList(endpoint, "VpcEndpointIds")));
             }
             api = apiGatewayService.updateRestApi(region, existing.getId(), operations);
         } else {
@@ -298,7 +304,7 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
             req.put("description", description);
             if (endpoint != null) {
                 Map<String, Object> epReq = new HashMap<>();
-                epReq.put("types", ctx.resolveStringList(endpoint, "Types"));
+                epReq.put("types", endpointTypes);
                 epReq.put("vpcEndpointIds", ctx.resolveStringList(endpoint, "VpcEndpointIds"));
                 req.put("endpointConfiguration", epReq);
             }
