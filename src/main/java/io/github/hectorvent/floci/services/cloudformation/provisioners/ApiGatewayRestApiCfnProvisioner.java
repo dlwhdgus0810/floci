@@ -442,10 +442,10 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
             delete(REST_API, apiId, region);
         } catch (RuntimeException deleteFailure) {
             failure.addSuppressed(deleteFailure);
-            String reason = "Could not remove REST API " + apiId + ", created for " + r.getLogicalId()
-                    + " by a failed update: " + deleteFailure.getMessage();
-            LOG.warn(reason);
-            r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, reason);
+            LOG.warnv("Could not remove REST API {0}, created for {1} by a failed update: {2}",
+                    apiId, r.getLogicalId(), deleteFailure.getMessage());
+            r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, "Could not remove REST API " + apiId
+                    + ", created for " + r.getLogicalId() + " by a failed update: " + deleteFailure.getMessage());
             ReplacementCleanup.recordOrphan(r, apiId, REST_API, region);
         }
     }
