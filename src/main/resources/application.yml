@@ -100,7 +100,7 @@ quarkus:
       - --initialize-at-run-time=io.github.hectorvent.floci.services.acm.CertificateGenerator
       - --initialize-at-run-time=io.github.hectorvent.floci.config.TlsConfigSource
       - --initialize-at-run-time=io.github.hectorvent.floci.services.cognito.CognitoSrpHelper
-      - --initialize-at-run-time=io.github.hectorvent.floci.services.cognito.CognitoTotp
+      - --initialize-at-run-time=io.github.hectorvent.floci.core.common.Totp
       - --initialize-at-run-time=io.github.hectorvent.floci.services.route53.Route53Service
       - --initialize-at-run-time=io.github.hectorvent.floci.services.kms.KmsService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.bedrockagentcore.BedrockAgentCoreEventService
@@ -141,6 +141,8 @@ floci:
   partitions:
     # id: aws  # Partition served (aws, aws-cn, aws-us-gov, aws-iso, aws-iso-b, aws-iso-e, aws-iso-f, aws-eusc).
                # Derived from default-region when unset. Env: FLOCI_PARTITIONS_ID
+    strict: false  # true rejects requests signed for a service AWS does not publish in the request's
+                   # partition (CloudFront in aws-us-gov, IAM in aws-eusc). Env: FLOCI_PARTITIONS_STRICT
     allow-unknown-regions: false  # true accepts a SigV4 scope region no partition publishes or admits by its
                                   # region pattern, giving it its own namespace. Env: FLOCI_PARTITIONS_ALLOW_UNKNOWN_REGIONS
   # Shared mock-response config for Textract/Comprehend/Rekognition/Translate. See AiMockConfigLoader.
@@ -326,6 +328,7 @@ floci:
       default-visibility-timeout: 30
       max-message-size: 1048576
       clear-fifo-deduplication-cache-on-purge: false
+      receipt-handle-secret: local-emulator-secret
     s3:
       enabled: true
       enforce-auth: false
@@ -600,6 +603,10 @@ floci:
       publish-awsvpc-ports-to-host: false
       host-volume-roots: []
       allow-unsafe-host-volumes: false
+      # Remove the ECS containers a previous run of this deployment left on the daemon before
+      # the service scheduler starts replacements. Scoped to this deployment's own containers.
+      reconcile-containers-on-startup: true
+      image-pull-behavior: default
       task-role-credentials:
         enabled: false
         ttl-seconds: 21600
